@@ -1,0 +1,34 @@
+# Flutter build
+flutter/build/
+flutter/.dart_tool/
+flutter/.packages
+flutter/.pub-cache/
+flutter/.flutter-plugins
+flutter/.flutter-plugins-dependencies
+
+# Android
+flutter/android/.gradle/
+flutter/android/app/build/
+flutter/android/local.properties
+*.apk
+
+# Laravel
+laravel/vendor/
+laravel/node_modules/
+laravel/.env
+laravel/storage/logs/*
+laravel/storage/framework/cache/*
+laravel/storage/framework/sessions/*
+laravel/storage/framework/views/*
+!laravel/storage/logs/.gitkeep
+!laravel/storage/framework/cache/.gitkeep
+!laravel/storage/framework/sessions/.gitkeep
+!laravel/storage/framework/views/.gitkeep
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+.DS_Store
