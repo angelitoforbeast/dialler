@@ -8,12 +8,15 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL"/>
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
 
     <application
         android:label="Dialer"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
-        android:usesCleartextTraffic="true">
+        android:usesCleartextTraffic="true"
+        android:requestLegacyExternalStorage="true">
 
         <!-- Main Flutter Activity - also handles DIAL intent -->
         <activity
@@ -62,6 +65,12 @@
                 <action android:name="android.telecom.InCallService"/>
             </intent-filter>
         </service>
+
+        <!-- Foreground Service for recording audio during calls -->
+        <service
+            android:name=".RecordingService"
+            android:exported="false"
+            android:foregroundServiceType="microphone"/>
 
         <meta-data android:name="flutterEmbedding" android:value="2"/>
     </application>

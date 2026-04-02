@@ -48,10 +48,12 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   bool _isMuted = false;
   bool _isSpeaker = false;
   bool _isRecording = false;
+  String _recordingStatus = '';
   String? _recordingPath;
   StreamSubscription? _callEventsSub;
   DateTime? _callStartTime;
   bool _callEndHandled = false;
+  Timer? _recordingCheckTimer;
 
   @override
   void initState() {
@@ -66,6 +68,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     await [
       Permission.microphone,
       Permission.phone,
+      Permission.notification,
     ].request();
   }
 
@@ -112,10 +115,14 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       _callNumber = number;
       _inCall = true;
       _callState = 'DIALING';
+      _recordingStatus = 'Starting...';
     });
 
-    // START RECORDING IMMEDIATELY - don't wait for ACTIVE state
+    // START RECORDING FIRST via Foreground Service
     await _startRecording();
+
+    // Poll recording status to confirm it started
+    _startRecordingStatusCheck();
 
     // START TIMER IMMEDIATELY
     _startCallTimer();
@@ -124,8 +131,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     try {
       await _callChannel.invokeMethod('placeCall', {'number': number});
     } catch (e) {
-      debugPrint('[makeCall] Error: $e');
-      // If call placement fails, stop everything
+      debugPrint('[makeCall] Error placing call: $e');
       _onCallEnded();
     }
   }
@@ -143,16 +149,56 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       final dir = await getApplicationDocumentsDirectory();
       final ts = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
       _recordingPath = '${dir.path}/call_$ts.m4a';
+      
+      debugPrint('[Recording] Starting foreground service: $_recordingPath');
       await _recorderChannel.invokeMethod('startRecording', {'path': _recordingPath});
-      setState(() => _isRecording = true);
-      debugPrint('[Recording] Started: $_recordingPath');
+      
+      setState(() {
+        _isRecording = true;
+        _recordingStatus = 'Recording started';
+      });
     } catch (e) {
-      debugPrint('[Recording] Failed to start: $e');
+      debugPrint('[Recording] Failed to start service: $e');
+      setState(() {
+        _recordingStatus = 'Error: $e';
+      });
     }
   }
 
+  void _startRecordingStatusCheck() {
+    _recordingCheckTimer?.cancel();
+    // Check recording status every 2 seconds for the first 10 seconds
+    int checks = 0;
+    _recordingCheckTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
+      checks++;
+      if (checks > 5 || !_inCall) {
+        timer.cancel();
+        return;
+      }
+      try {
+        final result = await _recorderChannel.invokeMethod('getRecordingStatus');
+        final data = Map<String, dynamic>.from(result);
+        final recording = data['isRecording'] == true;
+        final source = data['audioSource'] as String? ?? 'none';
+        final error = data['error'] as String? ?? '';
+
+        debugPrint('[RecordingStatus] recording=$recording source=$source error=$error');
+
+        setState(() {
+          _isRecording = recording;
+          if (recording) {
+            _recordingStatus = 'REC ($source)';
+          } else if (error.isNotEmpty) {
+            _recordingStatus = error;
+          }
+        });
+      } catch (e) {
+        debugPrint('[RecordingStatus] Check failed: $e');
+      }
+    });
+  }
+
   Future<void> _onCallEnded() async {
-    // Prevent double handling
     if (_callEndHandled) return;
     _callEndHandled = true;
 
@@ -160,49 +206,54 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 
     _callTimer?.cancel();
     _callTimer = null;
+    _recordingCheckTimer?.cancel();
+    _recordingCheckTimer = null;
 
-    // Calculate actual duration from start time as fallback
+    // Calculate actual duration
     int actualDuration = _callSeconds;
     if (_callStartTime != null) {
       final elapsed = DateTime.now().difference(_callStartTime!).inSeconds;
       if (elapsed > actualDuration) actualDuration = elapsed;
     }
 
-    // Stop recording
-    if (_isRecording) {
-      try {
-        await _recorderChannel.invokeMethod('stopRecording');
-        debugPrint('[Recording] Stopped');
-      } catch (e) {
-        debugPrint('[Recording] Stop error: $e');
-      }
+    // Stop recording service
+    try {
+      await _recorderChannel.invokeMethod('stopRecording');
+      debugPrint('[Recording] Stop requested');
+    } catch (e) {
+      debugPrint('[Recording] Stop error: $e');
     }
 
-    // ALWAYS save to history and upload (even if duration is 0)
+    // Wait a moment for the file to be finalized
+    await Future.delayed(const Duration(milliseconds: 500));
+
+    // Save and upload
     final savedPath = _recordingPath;
     final savedNumber = _callNumber;
     final savedDuration = actualDuration;
 
     if (savedPath != null) {
-      // Check if file exists and has content
       final file = File(savedPath);
       final fileExists = await file.exists();
       final fileSize = fileExists ? await file.length() : 0;
       debugPrint('[Recording] File exists=$fileExists size=$fileSize');
 
-      if (fileExists && fileSize > 0) {
-        final prefs = await SharedPreferences.getInstance();
-        final history = prefs.getStringList('call_history') ?? [];
-        history.insert(0, jsonEncode({
-          'number': savedNumber,
-          'duration': savedDuration,
-          'path': savedPath,
-          'date': DateTime.now().toIso8601String(),
-          'uploaded': false,
-        }));
-        await prefs.setStringList('call_history', history);
+      // Save to history
+      final prefs = await SharedPreferences.getInstance();
+      final history = prefs.getStringList('call_history') ?? [];
+      history.insert(0, jsonEncode({
+        'number': savedNumber,
+        'duration': savedDuration,
+        'path': savedPath,
+        'date': DateTime.now().toIso8601String(),
+        'uploaded': false,
+        'fileSize': fileSize,
+        'hasRecording': fileExists && fileSize > 100,
+      }));
+      await prefs.setStringList('call_history', history);
 
-        // Upload in background
+      // Upload if file exists and has content
+      if (fileExists && fileSize > 100) {
         _uploadRecording(savedPath, savedNumber, savedDuration);
       }
     }
@@ -214,6 +265,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       _isMuted = false;
       _isSpeaker = false;
       _isRecording = false;
+      _recordingStatus = '';
       _recordingPath = null;
       _callStartTime = null;
     });
@@ -259,7 +311,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     try {
       await _callChannel.invokeMethod('endCall');
     } catch (_) {}
-    // Also trigger onCallEnded as fallback (in case InCallService doesn't fire DISCONNECTED)
     Future.delayed(const Duration(seconds: 1), () {
       if (_inCall) _onCallEnded();
     });
@@ -281,11 +332,9 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     return '$m:$s';
   }
 
-  // Detect when app comes back to foreground (user might have ended call from notification)
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed && _inCall) {
-      // Check if call is still active
       _checkCallState();
     }
   }
@@ -306,6 +355,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _callEventsSub?.cancel();
     _callTimer?.cancel();
+    _recordingCheckTimer?.cancel();
     super.dispose();
   }
 
@@ -319,6 +369,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         isMuted: _isMuted,
         isSpeaker: _isSpeaker,
         isRecording: _isRecording,
+        recordingStatus: _recordingStatus,
         onEndCall: endCall,
         onToggleMute: toggleMute,
         onToggleSpeaker: toggleSpeaker,
@@ -361,6 +412,7 @@ class InCallScreen extends StatelessWidget {
   final bool isMuted;
   final bool isSpeaker;
   final bool isRecording;
+  final String recordingStatus;
   final VoidCallback onEndCall;
   final VoidCallback onToggleMute;
   final VoidCallback onToggleSpeaker;
@@ -368,7 +420,8 @@ class InCallScreen extends StatelessWidget {
   const InCallScreen({
     super.key, required this.number, required this.state, required this.timer,
     required this.isMuted, required this.isSpeaker, required this.isRecording,
-    required this.onEndCall, required this.onToggleMute, required this.onToggleSpeaker,
+    required this.recordingStatus, required this.onEndCall,
+    required this.onToggleMute, required this.onToggleSpeaker,
   });
 
   @override
@@ -381,30 +434,37 @@ class InCallScreen extends StatelessWidget {
             const Spacer(flex: 2),
             Text(number, style: const TextStyle(color: Colors.white, fontSize: 32, fontWeight: FontWeight.w300, letterSpacing: 2)),
             const SizedBox(height: 12),
-            // Always show timer
-            Text(
-              timer,
-              style: const TextStyle(color: Colors.greenAccent, fontSize: 24, fontWeight: FontWeight.w400),
-            ),
+            Text(timer, style: const TextStyle(color: Colors.greenAccent, fontSize: 24, fontWeight: FontWeight.w400)),
             const SizedBox(height: 4),
-            // Call state label
-            Text(
-              state,
-              style: TextStyle(color: Colors.white.withOpacity(0.5), fontSize: 14),
-            ),
-            const SizedBox(height: 8),
-            // Recording indicator
+            Text(state, style: const TextStyle(color: Colors.white38, fontSize: 14)),
+            const SizedBox(height: 12),
+            // Recording status - shows what audio source is being used
             if (isRecording)
-              Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Container(width: 10, height: 10, decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle)),
-                  const SizedBox(width: 8),
-                  const Text('REC', style: TextStyle(color: Colors.redAccent, fontSize: 14, fontWeight: FontWeight.bold)),
-                ],
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                decoration: BoxDecoration(
+                  color: Colors.red.withAlpha(40),
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(width: 10, height: 10, decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle)),
+                    const SizedBox(width: 8),
+                    Text(recordingStatus, style: const TextStyle(color: Colors.redAccent, fontSize: 13, fontWeight: FontWeight.bold)),
+                  ],
+                ),
+              )
+            else if (recordingStatus.isNotEmpty)
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                decoration: BoxDecoration(
+                  color: Colors.orange.withAlpha(40),
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Text(recordingStatus, style: const TextStyle(color: Colors.orangeAccent, fontSize: 12), textAlign: TextAlign.center),
               ),
             const Spacer(flex: 3),
-            // Mute / Speaker buttons
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceEvenly,
               children: [
@@ -686,6 +746,14 @@ class _RecentPageState extends State<RecentPage> {
     try { return DateFormat('MMM dd, HH:mm').format(DateTime.parse(iso)); } catch (_) { return iso; }
   }
 
+  String _fmtSize(dynamic bytes) {
+    final b = (bytes is int) ? bytes : int.tryParse(bytes.toString()) ?? 0;
+    if (b == 0) return 'No file';
+    if (b < 1024) return '${b}B';
+    if (b < 1024 * 1024) return '${(b / 1024).toStringAsFixed(1)}KB';
+    return '${(b / (1024 * 1024)).toStringAsFixed(1)}MB';
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -701,16 +769,26 @@ class _RecentPageState extends State<RecentPage> {
               itemBuilder: (context, i) {
                 final c = _calls[i];
                 final uploaded = c['uploaded'] == true;
+                final hasRecording = c['hasRecording'] == true;
+                final fileSize = c['fileSize'] ?? 0;
                 return ListTile(
                   leading: CircleAvatar(
-                    backgroundColor: uploaded ? Colors.green.shade50 : Colors.orange.shade50,
-                    child: Icon(uploaded ? Icons.cloud_done : Icons.cloud_upload, color: uploaded ? Colors.green : Colors.orange),
+                    backgroundColor: uploaded ? Colors.green.shade50 : (hasRecording ? Colors.orange.shade50 : Colors.red.shade50),
+                    child: Icon(
+                      uploaded ? Icons.cloud_done : (hasRecording ? Icons.cloud_upload : Icons.error_outline),
+                      color: uploaded ? Colors.green : (hasRecording ? Colors.orange : Colors.red),
+                    ),
                   ),
                   title: Text(c['number'] ?? 'Unknown', style: const TextStyle(fontWeight: FontWeight.w600)),
-                  subtitle: Text('${_fmt(c['duration'])}  •  ${_fmtDate(c['date'])}', style: const TextStyle(fontSize: 13)),
+                  subtitle: Text(
+                    '${_fmt(c['duration'])}  •  ${_fmtSize(fileSize)}  •  ${_fmtDate(c['date'])}',
+                    style: const TextStyle(fontSize: 12),
+                  ),
                   trailing: uploaded
                       ? const Icon(Icons.check_circle, color: Colors.green)
-                      : IconButton(icon: const Icon(Icons.upload, color: Colors.orange), onPressed: () => _retryUpload(c)),
+                      : (hasRecording
+                          ? IconButton(icon: const Icon(Icons.upload, color: Colors.orange), onPressed: () => _retryUpload(c))
+                          : const Icon(Icons.warning, color: Colors.red, size: 20)),
                 );
               },
             ),

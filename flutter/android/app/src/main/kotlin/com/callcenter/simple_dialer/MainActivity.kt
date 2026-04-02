@@ -2,11 +2,11 @@ package com.callcenter.simple_dialer
 
 import android.app.role.RoleManager
 import android.content.Intent
-import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.telecom.TelecomManager
+import android.util.Log
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -18,7 +18,6 @@ class MainActivity : FlutterActivity() {
     private val RECORDER_CHANNEL = "com.callcenter.simple_dialer/recorder"
     private val REQUEST_DEFAULT_DIALER = 1001
 
-    private var mediaRecorder: MediaRecorder? = null
     private var eventSink: EventChannel.EventSink? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -99,17 +98,27 @@ class MainActivity : FlutterActivity() {
             }
         }
 
-        // Recorder channel
+        // Recorder channel - now uses Foreground Service
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, RECORDER_CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
                 "startRecording" -> {
                     val path = call.argument<String>("path")
                     if (path != null) {
                         try {
-                            startRecording(path)
+                            val intent = Intent(this, RecordingService::class.java).apply {
+                                action = RecordingService.ACTION_START
+                                putExtra(RecordingService.EXTRA_PATH, path)
+                            }
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                startForegroundService(intent)
+                            } else {
+                                startService(intent)
+                            }
+                            Log.d("MainActivity", "RecordingService start requested for: $path")
                             result.success(true)
                         } catch (e: Exception) {
-                            result.error("RECORDING_ERROR", e.message, null)
+                            Log.e("MainActivity", "Failed to start RecordingService: ${e.message}")
+                            result.error("SERVICE_ERROR", e.message, null)
                         }
                     } else {
                         result.error("INVALID_PATH", "Path is null", null)
@@ -117,11 +126,23 @@ class MainActivity : FlutterActivity() {
                 }
                 "stopRecording" -> {
                     try {
-                        stopRecording()
+                        val intent = Intent(this, RecordingService::class.java).apply {
+                            action = RecordingService.ACTION_STOP
+                        }
+                        startService(intent)
+                        Log.d("MainActivity", "RecordingService stop requested")
                         result.success(true)
                     } catch (e: Exception) {
+                        Log.e("MainActivity", "Failed to stop RecordingService: ${e.message}")
                         result.error("STOP_ERROR", e.message, null)
                     }
+                }
+                "getRecordingStatus" -> {
+                    result.success(mapOf(
+                        "isRecording" to RecordingService.isRecording,
+                        "audioSource" to (RecordingService.audioSourceUsed ?: "none"),
+                        "error" to (RecordingService.lastError ?: "")
+                    ))
                 }
                 else -> result.notImplemented()
             }
@@ -130,7 +151,6 @@ class MainActivity : FlutterActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Handle incoming DIAL intent
         handleDialIntent(intent)
     }
 
@@ -143,7 +163,6 @@ class MainActivity : FlutterActivity() {
         if (intent?.action == Intent.ACTION_DIAL || intent?.action == Intent.ACTION_VIEW) {
             val number = intent.data?.schemeSpecificPart
             if (number != null) {
-                // Send the number to Flutter via method channel
                 flutterEngine?.dartExecutor?.binaryMessenger?.let { messenger ->
                     MethodChannel(messenger, METHOD_CHANNEL).invokeMethod("incomingDial", number)
                 }
@@ -170,33 +189,5 @@ class MainActivity : FlutterActivity() {
         val telecomManager = getSystemService(TELECOM_SERVICE) as TelecomManager
         val extras = Bundle()
         telecomManager.placeCall(uri, extras)
-    }
-
-    private fun startRecording(path: String) {
-        mediaRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            MediaRecorder(this)
-        } else {
-            @Suppress("DEPRECATION")
-            MediaRecorder()
-        }
-        mediaRecorder?.apply {
-            setAudioSource(MediaRecorder.AudioSource.MIC)
-            setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-            setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-            setAudioEncodingBitRate(128000)
-            setAudioSamplingRate(44100)
-            setAudioChannels(1)
-            setOutputFile(path)
-            prepare()
-            start()
-        }
-    }
-
-    private fun stopRecording() {
-        mediaRecorder?.apply {
-            try { stop() } catch (_: Exception) {}
-            release()
-        }
-        mediaRecorder = null
     }
 }
