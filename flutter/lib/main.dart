@@ -38,11 +38,11 @@ class MainScreen extends StatefulWidget {
   State<MainScreen> createState() => _MainScreenState();
 }
 
-class _MainScreenState extends State<MainScreen> {
+class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   int _tab = 0;
   bool _inCall = false;
   String _callNumber = '';
-  String _callState = '';
+  String _callState = 'IDLE';
   int _callSeconds = 0;
   Timer? _callTimer;
   bool _isMuted = false;
@@ -50,10 +50,13 @@ class _MainScreenState extends State<MainScreen> {
   bool _isRecording = false;
   String? _recordingPath;
   StreamSubscription? _callEventsSub;
+  DateTime? _callStartTime;
+  bool _callEndHandled = false;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _requestPermissions();
     _listenCallEvents();
     _setupMethodCallHandler();
@@ -71,10 +74,7 @@ class _MainScreenState extends State<MainScreen> {
       if (call.method == 'incomingDial') {
         final number = call.arguments as String?;
         if (number != null && number.isNotEmpty) {
-          setState(() {
-            _tab = 0; // Switch to dialer
-          });
-          // The dialer page will handle this via a global key or we set the number
+          setState(() => _tab = 0);
           _pendingDialNumber = number;
         }
       }
@@ -89,21 +89,45 @@ class _MainScreenState extends State<MainScreen> {
       final stateStr = data['stateStr'] as String;
       final number = data['number'] as String? ?? '';
 
+      debugPrint('[CallEvent] state=$stateStr number=$number');
+
       setState(() {
         _callState = stateStr;
         if (number.isNotEmpty) _callNumber = number;
       });
 
-      if (stateStr == 'ACTIVE' && !_inCall) {
-        setState(() => _inCall = true);
-        _startCallTimer();
-        _startRecording();
-      } else if (stateStr == 'DIALING' || stateStr == 'CONNECTING') {
-        setState(() => _inCall = true);
-      } else if (stateStr == 'DISCONNECTED') {
+      if (stateStr == 'DISCONNECTED') {
         _onCallEnded();
       }
     });
+  }
+
+  // Called when user taps the call button
+  void makeCall(String number) async {
+    if (number.isEmpty) return;
+    _callEndHandled = false;
+    _callStartTime = DateTime.now();
+
+    setState(() {
+      _callNumber = number;
+      _inCall = true;
+      _callState = 'DIALING';
+    });
+
+    // START RECORDING IMMEDIATELY - don't wait for ACTIVE state
+    await _startRecording();
+
+    // START TIMER IMMEDIATELY
+    _startCallTimer();
+
+    // Now place the actual call
+    try {
+      await _callChannel.invokeMethod('placeCall', {'number': number});
+    } catch (e) {
+      debugPrint('[makeCall] Error: $e');
+      // If call placement fails, stop everything
+      _onCallEnded();
+    }
   }
 
   void _startCallTimer() {
@@ -121,38 +145,77 @@ class _MainScreenState extends State<MainScreen> {
       _recordingPath = '${dir.path}/call_$ts.m4a';
       await _recorderChannel.invokeMethod('startRecording', {'path': _recordingPath});
       setState(() => _isRecording = true);
-    } catch (_) {}
+      debugPrint('[Recording] Started: $_recordingPath');
+    } catch (e) {
+      debugPrint('[Recording] Failed to start: $e');
+    }
   }
 
   Future<void> _onCallEnded() async {
+    // Prevent double handling
+    if (_callEndHandled) return;
+    _callEndHandled = true;
+
+    debugPrint('[CallEnded] duration=$_callSeconds recording=$_isRecording path=$_recordingPath');
+
     _callTimer?.cancel();
     _callTimer = null;
 
-    // Stop recording
-    if (_isRecording) {
-      try { await _recorderChannel.invokeMethod('stopRecording'); } catch (_) {}
+    // Calculate actual duration from start time as fallback
+    int actualDuration = _callSeconds;
+    if (_callStartTime != null) {
+      final elapsed = DateTime.now().difference(_callStartTime!).inSeconds;
+      if (elapsed > actualDuration) actualDuration = elapsed;
     }
 
-    // Save to history and upload
-    if (_recordingPath != null && _callSeconds > 0) {
-      final prefs = await SharedPreferences.getInstance();
-      final history = prefs.getStringList('call_history') ?? [];
-      history.insert(0, jsonEncode({
-        'number': _callNumber, 'duration': _callSeconds, 'path': _recordingPath,
-        'date': DateTime.now().toIso8601String(), 'uploaded': false,
-      }));
-      await prefs.setStringList('call_history', history);
-      _uploadRecording(_recordingPath!, _callNumber, _callSeconds);
+    // Stop recording
+    if (_isRecording) {
+      try {
+        await _recorderChannel.invokeMethod('stopRecording');
+        debugPrint('[Recording] Stopped');
+      } catch (e) {
+        debugPrint('[Recording] Stop error: $e');
+      }
+    }
+
+    // ALWAYS save to history and upload (even if duration is 0)
+    final savedPath = _recordingPath;
+    final savedNumber = _callNumber;
+    final savedDuration = actualDuration;
+
+    if (savedPath != null) {
+      // Check if file exists and has content
+      final file = File(savedPath);
+      final fileExists = await file.exists();
+      final fileSize = fileExists ? await file.length() : 0;
+      debugPrint('[Recording] File exists=$fileExists size=$fileSize');
+
+      if (fileExists && fileSize > 0) {
+        final prefs = await SharedPreferences.getInstance();
+        final history = prefs.getStringList('call_history') ?? [];
+        history.insert(0, jsonEncode({
+          'number': savedNumber,
+          'duration': savedDuration,
+          'path': savedPath,
+          'date': DateTime.now().toIso8601String(),
+          'uploaded': false,
+        }));
+        await prefs.setStringList('call_history', history);
+
+        // Upload in background
+        _uploadRecording(savedPath, savedNumber, savedDuration);
+      }
     }
 
     setState(() {
       _inCall = false;
-      _callState = '';
+      _callState = 'IDLE';
       _callSeconds = 0;
       _isMuted = false;
       _isSpeaker = false;
       _isRecording = false;
       _recordingPath = null;
+      _callStartTime = null;
     });
   }
 
@@ -160,6 +223,9 @@ class _MainScreenState extends State<MainScreen> {
     try {
       final prefs = await SharedPreferences.getInstance();
       final agentName = prefs.getString('agent_name') ?? 'Agent';
+
+      debugPrint('[Upload] Starting: caller=$agentName callee=$number duration=$duration');
+
       final request = http.MultipartRequest('POST', Uri.parse('$serverUrl/upload-recording'));
       request.headers['Accept'] = 'application/json';
       request.fields['caller'] = agentName;
@@ -167,7 +233,11 @@ class _MainScreenState extends State<MainScreen> {
       request.fields['duration'] = duration.toString();
       request.fields['status'] = 'ANSWERED';
       request.files.add(await http.MultipartFile.fromPath('recording', path));
+
       final response = await request.send();
+      final body = await response.stream.bytesToString();
+      debugPrint('[Upload] Response: ${response.statusCode} $body');
+
       if (response.statusCode == 200) {
         final history = prefs.getStringList('call_history') ?? [];
         for (int i = 0; i < history.length; i++) {
@@ -180,21 +250,19 @@ class _MainScreenState extends State<MainScreen> {
         }
         await prefs.setStringList('call_history', history);
       }
-    } catch (_) {}
-  }
-
-  void makeCall(String number) async {
-    if (number.isEmpty) return;
-    setState(() { _callNumber = number; _inCall = true; _callState = 'DIALING'; });
-    try {
-      await _callChannel.invokeMethod('placeCall', {'number': number});
     } catch (e) {
-      setState(() { _inCall = false; _callState = ''; });
+      debugPrint('[Upload] Error: $e');
     }
   }
 
   void endCall() async {
-    try { await _callChannel.invokeMethod('endCall'); } catch (_) {}
+    try {
+      await _callChannel.invokeMethod('endCall');
+    } catch (_) {}
+    // Also trigger onCallEnded as fallback (in case InCallService doesn't fire DISCONNECTED)
+    Future.delayed(const Duration(seconds: 1), () {
+      if (_inCall) _onCallEnded();
+    });
   }
 
   void toggleMute() async {
@@ -213,8 +281,29 @@ class _MainScreenState extends State<MainScreen> {
     return '$m:$s';
   }
 
+  // Detect when app comes back to foreground (user might have ended call from notification)
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && _inCall) {
+      // Check if call is still active
+      _checkCallState();
+    }
+  }
+
+  Future<void> _checkCallState() async {
+    try {
+      final result = await _callChannel.invokeMethod('getCallState');
+      final data = Map<String, dynamic>.from(result);
+      if (data['hasCall'] != true && _inCall) {
+        debugPrint('[LifecycleCheck] Call ended while app was in background');
+        _onCallEnded();
+      }
+    } catch (_) {}
+  }
+
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _callEventsSub?.cancel();
     _callTimer?.cancel();
     super.dispose();
@@ -222,7 +311,6 @@ class _MainScreenState extends State<MainScreen> {
 
   @override
   Widget build(BuildContext context) {
-    // Show in-call screen when in a call
     if (_inCall) {
       return InCallScreen(
         number: _callNumber,
@@ -285,20 +373,24 @@ class InCallScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final isActive = state == 'ACTIVE';
     return Scaffold(
       backgroundColor: const Color(0xFF1a1a2e),
       body: SafeArea(
         child: Column(
           children: [
             const Spacer(flex: 2),
-            // Number
             Text(number, style: const TextStyle(color: Colors.white, fontSize: 32, fontWeight: FontWeight.w300, letterSpacing: 2)),
             const SizedBox(height: 12),
-            // State / Timer
+            // Always show timer
             Text(
-              isActive ? timer : state,
-              style: TextStyle(color: isActive ? Colors.greenAccent : Colors.white70, fontSize: 20, fontWeight: FontWeight.w400),
+              timer,
+              style: const TextStyle(color: Colors.greenAccent, fontSize: 24, fontWeight: FontWeight.w400),
+            ),
+            const SizedBox(height: 4),
+            // Call state label
+            Text(
+              state,
+              style: TextStyle(color: Colors.white.withOpacity(0.5), fontSize: 14),
             ),
             const SizedBox(height: 8),
             // Recording indicator
@@ -308,11 +400,11 @@ class InCallScreen extends StatelessWidget {
                 children: [
                   Container(width: 10, height: 10, decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle)),
                   const SizedBox(width: 8),
-                  const Text('Recording', style: TextStyle(color: Colors.redAccent, fontSize: 14)),
+                  const Text('REC', style: TextStyle(color: Colors.redAccent, fontSize: 14, fontWeight: FontWeight.bold)),
                 ],
               ),
             const Spacer(flex: 3),
-            // Call controls
+            // Mute / Speaker buttons
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceEvenly,
               children: [
@@ -331,7 +423,6 @@ class InCallScreen extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 40),
-            // End call button
             GestureDetector(
               onTap: onEndCall,
               child: Container(
@@ -437,7 +528,6 @@ class _DialerPageState extends State<DialerPage> {
       ),
       body: Column(
         children: [
-          // Default dialer banner
           if (!_defaultDialerChecked)
             Container(
               width: double.infinity,
@@ -456,10 +546,7 @@ class _DialerPageState extends State<DialerPage> {
                 ],
               ),
             ),
-
           const Spacer(),
-
-          // Number display
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 32),
             child: Text(
@@ -472,8 +559,6 @@ class _DialerPageState extends State<DialerPage> {
             ),
           ),
           const SizedBox(height: 32),
-
-          // Dial pad
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 40),
             child: Column(
@@ -490,8 +575,6 @@ class _DialerPageState extends State<DialerPage> {
             ),
           ),
           const SizedBox(height: 16),
-
-          // Call + backspace
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 40),
             child: Row(
