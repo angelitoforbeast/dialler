@@ -8,10 +8,12 @@ import 'package:intl/intl.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:url_launcher/url_launcher.dart';
 
 const String serverUrl = 'http://72.62.75.18:8000/api';
+
+const _callChannel = MethodChannel('com.callcenter.simple_dialer/calls');
 const _recorderChannel = MethodChannel('com.callcenter.simple_dialer/recorder');
+const _callEvents = EventChannel('com.callcenter.simple_dialer/call_events');
 
 void main() => runApp(const SimpleDialerApp());
 
@@ -22,14 +24,13 @@ class SimpleDialerApp extends StatelessWidget {
     return MaterialApp(
       title: 'Dialer',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorSchemeSeed: const Color(0xFF0D47A1),
-        useMaterial3: true,
-      ),
+      theme: ThemeData(colorSchemeSeed: const Color(0xFF0D47A1), useMaterial3: true),
       home: const MainScreen(),
     );
   }
 }
+
+// ─── MAIN SCREEN ────────────────────────────────────────────────────────────
 
 class MainScreen extends StatefulWidget {
   const MainScreen({super.key});
@@ -39,97 +40,120 @@ class MainScreen extends StatefulWidget {
 
 class _MainScreenState extends State<MainScreen> {
   int _tab = 0;
-  final _pages = const [DialerPage(), RecentPage(), RecordingsPage(), SettingsPage()];
+  bool _inCall = false;
+  String _callNumber = '';
+  String _callState = '';
+  int _callSeconds = 0;
+  Timer? _callTimer;
+  bool _isMuted = false;
+  bool _isSpeaker = false;
+  bool _isRecording = false;
+  String? _recordingPath;
+  StreamSubscription? _callEventsSub;
 
   @override
   void initState() {
     super.initState();
     _requestPermissions();
+    _listenCallEvents();
+    _setupMethodCallHandler();
   }
 
   Future<void> _requestPermissions() async {
-    await [Permission.microphone, Permission.phone].request();
+    await [
+      Permission.microphone,
+      Permission.phone,
+    ].request();
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: _pages[_tab],
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _tab,
-        onDestinationSelected: (i) => setState(() => _tab = i),
-        destinations: const [
-          NavigationDestination(icon: Icon(Icons.dialpad), label: 'Dialer'),
-          NavigationDestination(icon: Icon(Icons.history), label: 'Recent'),
-          NavigationDestination(icon: Icon(Icons.cloud_done), label: 'Uploaded'),
-          NavigationDestination(icon: Icon(Icons.settings), label: 'Settings'),
-        ],
-      ),
-    );
-  }
-}
-
-class DialerPage extends StatefulWidget {
-  const DialerPage({super.key});
-  @override
-  State<DialerPage> createState() => _DialerPageState();
-}
-
-class _DialerPageState extends State<DialerPage> {
-  String _number = '';
-  bool _isRecording = false;
-  int _seconds = 0;
-  Timer? _timer;
-  String? _currentPath;
-
-  void _addDigit(String d) => setState(() => _number += d);
-  void _backspace() {
-    if (_number.isNotEmpty) setState(() => _number = _number.substring(0, _number.length - 1));
+  void _setupMethodCallHandler() {
+    _callChannel.setMethodCallHandler((call) async {
+      if (call.method == 'incomingDial') {
+        final number = call.arguments as String?;
+        if (number != null && number.isNotEmpty) {
+          setState(() {
+            _tab = 0; // Switch to dialer
+          });
+          // The dialer page will handle this via a global key or we set the number
+          _pendingDialNumber = number;
+        }
+      }
+    });
   }
 
-  Future<void> _call() async {
-    if (_number.isEmpty) return;
+  String? _pendingDialNumber;
+
+  void _listenCallEvents() {
+    _callEventsSub = _callEvents.receiveBroadcastStream().listen((event) {
+      final data = Map<String, dynamic>.from(event);
+      final stateStr = data['stateStr'] as String;
+      final number = data['number'] as String? ?? '';
+
+      setState(() {
+        _callState = stateStr;
+        if (number.isNotEmpty) _callNumber = number;
+      });
+
+      if (stateStr == 'ACTIVE' && !_inCall) {
+        setState(() => _inCall = true);
+        _startCallTimer();
+        _startRecording();
+      } else if (stateStr == 'DIALING' || stateStr == 'CONNECTING') {
+        setState(() => _inCall = true);
+      } else if (stateStr == 'DISCONNECTED') {
+        _onCallEnded();
+      }
+    });
+  }
+
+  void _startCallTimer() {
+    _callSeconds = 0;
+    _callTimer?.cancel();
+    _callTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      setState(() => _callSeconds++);
+    });
+  }
+
+  Future<void> _startRecording() async {
     try {
       final dir = await getApplicationDocumentsDirectory();
       final ts = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
-      _currentPath = '${dir.path}/call_$ts.m4a';
-      await _recorderChannel.invokeMethod('startRecording', {'path': _currentPath});
-      setState(() { _isRecording = true; _seconds = 0; });
-      _timer = Timer.periodic(const Duration(seconds: 1), (_) {
-        setState(() => _seconds++);
-      });
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Mic error: $e'), backgroundColor: Colors.red),
-        );
-      }
-      return;
-    }
-    final uri = Uri(scheme: 'tel', path: _number);
-    if (await canLaunchUrl(uri)) await launchUrl(uri);
+      _recordingPath = '${dir.path}/call_$ts.m4a';
+      await _recorderChannel.invokeMethod('startRecording', {'path': _recordingPath});
+      setState(() => _isRecording = true);
+    } catch (_) {}
   }
 
-  Future<void> _stopAndSave() async {
-    _timer?.cancel();
-    _timer = null;
-    try { await _recorderChannel.invokeMethod('stopRecording'); } catch (_) {}
-    if (_currentPath != null) {
+  Future<void> _onCallEnded() async {
+    _callTimer?.cancel();
+    _callTimer = null;
+
+    // Stop recording
+    if (_isRecording) {
+      try { await _recorderChannel.invokeMethod('stopRecording'); } catch (_) {}
+    }
+
+    // Save to history and upload
+    if (_recordingPath != null && _callSeconds > 0) {
       final prefs = await SharedPreferences.getInstance();
       final history = prefs.getStringList('call_history') ?? [];
       history.insert(0, jsonEncode({
-        'number': _number, 'duration': _seconds, 'path': _currentPath,
+        'number': _callNumber, 'duration': _callSeconds, 'path': _recordingPath,
         'date': DateTime.now().toIso8601String(), 'uploaded': false,
       }));
       await prefs.setStringList('call_history', history);
-      _uploadRecording(_currentPath!, _number, _seconds);
+      _uploadRecording(_recordingPath!, _callNumber, _callSeconds);
     }
-    setState(() { _isRecording = false; _seconds = 0; _currentPath = null; });
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Recording saved & uploading...'), backgroundColor: Colors.green),
-      );
-    }
+
+    setState(() {
+      _inCall = false;
+      _callState = '';
+      _callSeconds = 0;
+      _isMuted = false;
+      _isSpeaker = false;
+      _isRecording = false;
+      _recordingPath = null;
+    });
   }
 
   Future<void> _uploadRecording(String path, String number, int duration) async {
@@ -159,14 +183,248 @@ class _DialerPageState extends State<DialerPage> {
     } catch (_) {}
   }
 
+  void makeCall(String number) async {
+    if (number.isEmpty) return;
+    setState(() { _callNumber = number; _inCall = true; _callState = 'DIALING'; });
+    try {
+      await _callChannel.invokeMethod('placeCall', {'number': number});
+    } catch (e) {
+      setState(() { _inCall = false; _callState = ''; });
+    }
+  }
+
+  void endCall() async {
+    try { await _callChannel.invokeMethod('endCall'); } catch (_) {}
+  }
+
+  void toggleMute() async {
+    setState(() => _isMuted = !_isMuted);
+    try { await _callChannel.invokeMethod('muteCall', {'mute': _isMuted}); } catch (_) {}
+  }
+
+  void toggleSpeaker() async {
+    setState(() => _isSpeaker = !_isSpeaker);
+    try { await _callChannel.invokeMethod('speakerOn', {'on': _isSpeaker}); } catch (_) {}
+  }
+
   String get _timerText {
-    final m = (_seconds ~/ 60).toString().padLeft(2, '0');
-    final s = (_seconds % 60).toString().padLeft(2, '0');
+    final m = (_callSeconds ~/ 60).toString().padLeft(2, '0');
+    final s = (_callSeconds % 60).toString().padLeft(2, '0');
     return '$m:$s';
   }
 
   @override
-  void dispose() { _timer?.cancel(); super.dispose(); }
+  void dispose() {
+    _callEventsSub?.cancel();
+    _callTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Show in-call screen when in a call
+    if (_inCall) {
+      return InCallScreen(
+        number: _callNumber,
+        state: _callState,
+        timer: _timerText,
+        isMuted: _isMuted,
+        isSpeaker: _isSpeaker,
+        isRecording: _isRecording,
+        onEndCall: endCall,
+        onToggleMute: toggleMute,
+        onToggleSpeaker: toggleSpeaker,
+      );
+    }
+
+    return Scaffold(
+      body: IndexedStack(
+        index: _tab,
+        children: [
+          DialerPage(onCall: makeCall, pendingNumber: _pendingDialNumber),
+          const RecentPage(),
+          const RecordingsPage(),
+          const SettingsPage(),
+        ],
+      ),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _tab,
+        onDestinationSelected: (i) {
+          setState(() => _tab = i);
+          _pendingDialNumber = null;
+        },
+        destinations: const [
+          NavigationDestination(icon: Icon(Icons.dialpad), label: 'Dialer'),
+          NavigationDestination(icon: Icon(Icons.history), label: 'Recent'),
+          NavigationDestination(icon: Icon(Icons.cloud_done), label: 'Uploaded'),
+          NavigationDestination(icon: Icon(Icons.settings), label: 'Settings'),
+        ],
+      ),
+    );
+  }
+}
+
+// ─── IN-CALL SCREEN ─────────────────────────────────────────────────────────
+
+class InCallScreen extends StatelessWidget {
+  final String number;
+  final String state;
+  final String timer;
+  final bool isMuted;
+  final bool isSpeaker;
+  final bool isRecording;
+  final VoidCallback onEndCall;
+  final VoidCallback onToggleMute;
+  final VoidCallback onToggleSpeaker;
+
+  const InCallScreen({
+    super.key, required this.number, required this.state, required this.timer,
+    required this.isMuted, required this.isSpeaker, required this.isRecording,
+    required this.onEndCall, required this.onToggleMute, required this.onToggleSpeaker,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final isActive = state == 'ACTIVE';
+    return Scaffold(
+      backgroundColor: const Color(0xFF1a1a2e),
+      body: SafeArea(
+        child: Column(
+          children: [
+            const Spacer(flex: 2),
+            // Number
+            Text(number, style: const TextStyle(color: Colors.white, fontSize: 32, fontWeight: FontWeight.w300, letterSpacing: 2)),
+            const SizedBox(height: 12),
+            // State / Timer
+            Text(
+              isActive ? timer : state,
+              style: TextStyle(color: isActive ? Colors.greenAccent : Colors.white70, fontSize: 20, fontWeight: FontWeight.w400),
+            ),
+            const SizedBox(height: 8),
+            // Recording indicator
+            if (isRecording)
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Container(width: 10, height: 10, decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle)),
+                  const SizedBox(width: 8),
+                  const Text('Recording', style: TextStyle(color: Colors.redAccent, fontSize: 14)),
+                ],
+              ),
+            const Spacer(flex: 3),
+            // Call controls
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: [
+                _CallButton(
+                  icon: isMuted ? Icons.mic_off : Icons.mic,
+                  label: isMuted ? 'Unmute' : 'Mute',
+                  color: isMuted ? Colors.red : Colors.white24,
+                  onTap: onToggleMute,
+                ),
+                _CallButton(
+                  icon: isSpeaker ? Icons.volume_up : Icons.volume_down,
+                  label: isSpeaker ? 'Speaker On' : 'Speaker',
+                  color: isSpeaker ? Colors.blue : Colors.white24,
+                  onTap: onToggleSpeaker,
+                ),
+              ],
+            ),
+            const SizedBox(height: 40),
+            // End call button
+            GestureDetector(
+              onTap: onEndCall,
+              child: Container(
+                width: 80, height: 80,
+                decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle),
+                child: const Icon(Icons.call_end, color: Colors.white, size: 36),
+              ),
+            ),
+            const SizedBox(height: 16),
+            const Text('End Call', style: TextStyle(color: Colors.white70, fontSize: 14)),
+            const Spacer(),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _CallButton extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final Color color;
+  final VoidCallback onTap;
+  const _CallButton({required this.icon, required this.label, required this.color, required this.onTap});
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Column(
+        children: [
+          Container(
+            width: 64, height: 64,
+            decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+            child: Icon(icon, color: Colors.white, size: 28),
+          ),
+          const SizedBox(height: 8),
+          Text(label, style: const TextStyle(color: Colors.white70, fontSize: 12)),
+        ],
+      ),
+    );
+  }
+}
+
+// ─── DIALER PAGE ────────────────────────────────────────────────────────────
+
+class DialerPage extends StatefulWidget {
+  final Function(String) onCall;
+  final String? pendingNumber;
+  const DialerPage({super.key, required this.onCall, this.pendingNumber});
+  @override
+  State<DialerPage> createState() => _DialerPageState();
+}
+
+class _DialerPageState extends State<DialerPage> {
+  String _number = '';
+  bool _defaultDialerChecked = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.pendingNumber != null && widget.pendingNumber!.isNotEmpty) {
+      _number = widget.pendingNumber!;
+    }
+    _checkDefaultDialer();
+  }
+
+  @override
+  void didUpdateWidget(DialerPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.pendingNumber != null && widget.pendingNumber != oldWidget.pendingNumber) {
+      setState(() => _number = widget.pendingNumber!);
+    }
+  }
+
+  Future<void> _checkDefaultDialer() async {
+    try {
+      final isDefault = await _callChannel.invokeMethod('isDefaultDialer');
+      setState(() => _defaultDialerChecked = isDefault == true);
+    } catch (_) {}
+  }
+
+  Future<void> _requestDefaultDialer() async {
+    try {
+      await _callChannel.invokeMethod('requestDefaultDialer');
+      await Future.delayed(const Duration(seconds: 2));
+      _checkDefaultDialer();
+    } catch (_) {}
+  }
+
+  void _addDigit(String d) => setState(() => _number += d);
+  void _backspace() {
+    if (_number.isNotEmpty) setState(() => _number = _number.substring(0, _number.length - 1));
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -179,28 +437,29 @@ class _DialerPageState extends State<DialerPage> {
       ),
       body: Column(
         children: [
-          if (_isRecording)
+          // Default dialer banner
+          if (!_defaultDialerChecked)
             Container(
               width: double.infinity,
-              padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 20),
-              color: Colors.red,
+              padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 16),
+              color: Colors.orange.shade50,
               child: Row(
                 children: [
-                  const Icon(Icons.fiber_manual_record, color: Colors.white, size: 16),
+                  Icon(Icons.warning_amber, color: Colors.orange.shade700, size: 20),
                   const SizedBox(width: 8),
-                  Text('REC  $_timerText',
-                      style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 18)),
-                  const Spacer(),
-                  ElevatedButton.icon(
-                    onPressed: _stopAndSave,
-                    icon: const Icon(Icons.stop, color: Colors.red),
-                    label: const Text('End & Save'),
-                    style: ElevatedButton.styleFrom(backgroundColor: Colors.white, foregroundColor: Colors.red),
+                  Expanded(child: Text('Set as default phone app for in-app calling',
+                      style: TextStyle(color: Colors.orange.shade900, fontSize: 13))),
+                  TextButton(
+                    onPressed: _requestDefaultDialer,
+                    child: const Text('Set Now', style: TextStyle(fontWeight: FontWeight.bold)),
                   ),
                 ],
               ),
             ),
+
           const Spacer(),
+
+          // Number display
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 32),
             child: Text(
@@ -213,6 +472,8 @@ class _DialerPageState extends State<DialerPage> {
             ),
           ),
           const SizedBox(height: 32),
+
+          // Dial pad
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 40),
             child: Column(
@@ -229,6 +490,8 @@ class _DialerPageState extends State<DialerPage> {
             ),
           ),
           const SizedBox(height: 16),
+
+          // Call + backspace
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 40),
             child: Row(
@@ -236,10 +499,10 @@ class _DialerPageState extends State<DialerPage> {
               children: [
                 const SizedBox(width: 64),
                 GestureDetector(
-                  onTap: _isRecording ? null : _call,
+                  onTap: () => widget.onCall(_number),
                   child: Container(
                     width: 72, height: 72,
-                    decoration: BoxDecoration(color: _isRecording ? Colors.grey : Colors.green, shape: BoxShape.circle),
+                    decoration: const BoxDecoration(color: Colors.green, shape: BoxShape.circle),
                     child: const Icon(Icons.call, color: Colors.white, size: 32),
                   ),
                 ),
@@ -278,6 +541,8 @@ class _DialButton extends StatelessWidget {
   }
 }
 
+// ─── RECENT CALLS ───────────────────────────────────────────────────────────
+
 class RecentPage extends StatefulWidget {
   const RecentPage({super.key});
   @override
@@ -301,8 +566,7 @@ class _RecentPageState extends State<RecentPage> {
       final prefs = await SharedPreferences.getInstance();
       final agentName = prefs.getString('agent_name') ?? 'Agent';
       final path = call['path'] as String;
-      final file = File(path);
-      if (!await file.exists()) {
+      if (!await File(path).exists()) {
         if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('File not found'), backgroundColor: Colors.red));
         return;
       }
@@ -371,6 +635,8 @@ class _RecentPageState extends State<RecentPage> {
   }
 }
 
+// ─── SERVER RECORDINGS ──────────────────────────────────────────────────────
+
 class RecordingsPage extends StatefulWidget {
   const RecordingsPage({super.key});
   @override
@@ -433,6 +699,8 @@ class _RecordingsPageState extends State<RecordingsPage> {
   }
 }
 
+// ─── SETTINGS ───────────────────────────────────────────────────────────────
+
 class SettingsPage extends StatefulWidget {
   const SettingsPage({super.key});
   @override
@@ -441,6 +709,7 @@ class SettingsPage extends StatefulWidget {
 
 class _SettingsPageState extends State<SettingsPage> {
   final _nameController = TextEditingController();
+  bool _isDefaultDialer = false;
 
   @override
   void initState() { super.initState(); _load(); }
@@ -448,12 +717,24 @@ class _SettingsPageState extends State<SettingsPage> {
   Future<void> _load() async {
     final prefs = await SharedPreferences.getInstance();
     _nameController.text = prefs.getString('agent_name') ?? '';
+    try {
+      final isDefault = await _callChannel.invokeMethod('isDefaultDialer');
+      setState(() => _isDefaultDialer = isDefault == true);
+    } catch (_) {}
   }
 
   Future<void> _save() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('agent_name', _nameController.text.trim());
     if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Saved!'), backgroundColor: Colors.green));
+  }
+
+  Future<void> _setDefaultDialer() async {
+    try {
+      await _callChannel.invokeMethod('requestDefaultDialer');
+      await Future.delayed(const Duration(seconds: 2));
+      _load();
+    } catch (_) {}
   }
 
   Future<void> _clearHistory() async {
@@ -480,13 +761,34 @@ class _SettingsPageState extends State<SettingsPage> {
           TextField(
             controller: _nameController,
             decoration: InputDecoration(
-              hintText: 'Enter your name (shown in recordings)',
+              hintText: 'Enter your name',
               border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
               prefixIcon: const Icon(Icons.person),
             ),
           ),
           const SizedBox(height: 16),
           FilledButton.icon(onPressed: _save, icon: const Icon(Icons.save), label: const Text('Save')),
+          const SizedBox(height: 32),
+          const Divider(),
+          const SizedBox(height: 16),
+          const Text('Default Phone App', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 16)),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Icon(_isDefaultDialer ? Icons.check_circle : Icons.cancel,
+                  color: _isDefaultDialer ? Colors.green : Colors.grey),
+              const SizedBox(width: 8),
+              Text(_isDefaultDialer ? 'This app is the default dialer' : 'Not set as default dialer'),
+            ],
+          ),
+          if (!_isDefaultDialer) ...[
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              onPressed: _setDefaultDialer,
+              icon: const Icon(Icons.phone),
+              label: const Text('Set as Default Phone App'),
+            ),
+          ],
           const SizedBox(height: 32),
           const Divider(),
           const SizedBox(height: 16),
